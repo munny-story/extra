@@ -1,0 +1,200 @@
+require('dotenv').config({});
+const { redisHashSetReadUser, redisHashSetWriteUser } = require('../../lib/utils');
+const config = require('../../lib/globalConfig');
+const exchangeUtil = require('../../lib/exchangeHelper');
+let { asyncMongoDB } = require('../../lib/utils');
+let bot_config = config.marketMakingBot;
+let exchange_data = {
+    exchange_id: bot_config.exchange_id,
+    api_keys: bot_config.api_keys,
+    api_secret: bot_config.api_secret
+};
+
+let mongoDb, state = {
+    pricePrecision: 0.00000001,
+    precisionValue: 8
+}
+
+const start = async () => {
+    try {
+        mongoDb = await asyncMongoDB();
+        await calculatePricePrecision();
+        startMarketMaking();
+    } catch (e) {
+        return;
+    }
+}
+
+function init() {
+    start();
+}
+
+init();
+
+// function used to start market making cron
+async function startMarketMaking() {
+    let interval = setInterval(() => {
+        placeOrders();
+    }, bot_config.refresh_rate);
+}
+
+// place buy and sell order
+async function placeOrders() {
+
+    let best = await getBest();
+
+    let mid_price = (best.ask + best.bid) / 2;
+    let min_price = mid_price * (bot_config.spreed / 100);
+    min_price = Number(min_price.toFixed(state.precisionValue));
+    let spread_ask = Number((mid_price + min_price).toFixed(state.precisionValue));
+    let spread_bid = Number((mid_price - min_price).toFixed(state.precisionValue));
+    let currentTime = Date.now();
+
+    let store = await getUserOrdersStatus();
+    // check wheter that order is stucked in a stair case under freezeRefreshTime time if yes then cancel that order
+    if (store.timestamp && ((store.timestamp + bot_config.freezeRefreshTime) > currentTime) && (!!store.ask ^ !!store.bid)) {
+        if (store.ask) store.ask = await checkForCancelOrder(store.ask, best.ask);
+        if (store.bid) store.bid = await checkForCancelOrder(store.bid, best.bid);
+    } else if ((store.ask || store.bid)) {
+        // check whether that our order need to update
+        if (store.ask) store.ask = await checkAndUpdateOrder(store.ask, 'sell', best.ask);
+        if (store.bid) store.bid = await checkAndUpdateOrder(store.bid, 'buy', best.bid);
+    }
+    // place sell and buy order both
+    if (!store.ask && !store.bid) {
+        store.ask = await createOrder(exchange_data, 'sell', calculateSpreadPrice(best.ask, spread_ask, 'sell'), bot_config.amount);
+        store.bid = await createOrder(exchange_data, 'buy', calculateSpreadPrice(best.bid, spread_bid, 'buy'), spread_bid, bot_config.amount);
+    }
+    await updateUserOrder(store);
+}
+
+// function is used to canel the order
+async function checkForCancelOrder(order, price) {
+    if (order.price == price) return order;
+    else {
+        let cancel = await cancelOrder(orderId, bot_config.symbol);
+        if (cancel) return false;
+        return order;
+    }
+}
+
+// function is used to get current running order status and update it if needed.
+async function checkAndUpdateOrder(order, type, currentPirce) {
+    let runningOrder = checkOrderStatus(order);
+    if (runningOrder) {
+        if (runningOrder.price == currentPirce) return order;
+        else {
+            let spreadPrice = calculateSpreadPrice(currentPirce, order.spread_price, type);
+            if (spreadPrice != runningOrder.price) {
+                let cancel = await cancelOrder(order.id, order.symbol);
+                let newOrder = await createOrder(exchange_data, type, spread_bid, bot_config.amount);
+                return newOrder;
+            } else {
+                return order;
+            }
+        }
+    } else return false;
+}
+
+
+// function is used to calculate minimum spread price
+function calculateSpreadPrice(currentPirce, spread_price, type) {
+    let newPrice = 0;
+    if (type == 'buy') {
+        newPrice = currentPirce + state.pricePrecision;
+    } else {
+        newPrice = currentPirce - state.pricePrecision;
+    }
+
+    if (type == 'buy') {
+        if (newPrice > spread_price) return spread_price;
+        else return newPrice;
+    } else {
+        if (newPrice < spread_price) return spread_price;
+        else return newPrice;
+    }
+}
+
+// function is used to create exchange order for market making bot;
+async function createOrder(exchange_data, type, price, amount) {
+    let obj = {
+        symbol: bot_config.symbol,
+        type: 'limit',
+        side: type,
+        amount: amount,
+        price: price
+    };
+
+    let order = await exchangeUtil.createOrder(exchange_data, obj);
+    return order;
+}
+
+// function is used to get user order status placed through market making
+async function getUserOrdersStatus() {
+    let store = await redisHashSetReadUser(config.redis.marketMaking, `${bot_config.exchange_id}_${bot_config.symbol}`) || {};
+    return store;
+}
+
+// function is used to update user data in redis.
+async function updateUserOrder(store) {
+    let store = await redisHashSetWriteUser(config.redis.marketMaking, `${bot_config.exchange_id}_${bot_config.symbol}`, store);
+    return true;
+}
+
+// function is used to fetch order status and if closed update to db
+async function checkOrderStatus(order) {
+    try {
+        let params = {
+            id: order.orderId,
+            symbol: bot_config.symbol
+        }
+        let order = await exchangeUtil.fetchOrder(exchange_data, params);
+        if (order.status) {
+            if (order.data.status == 'closed') {
+                // entry in database;
+                order.data['exchange_id'] = exchange_data.exchange_id;
+                order.data['orderId'] = order.data['id'];
+                console.log(order.data);
+                // mongoDb.collection('marketMaking').create(order.data);
+                return false;
+            } else {
+                return order;
+            }
+        } else {
+            return false
+        }
+    } catch (e) {
+        return false;
+    }
+}
+
+// function used to cancel user exchange trade order
+async function cancelOrder(orderId, symbol) {
+    let order = await exchangeUtil.cancelOrder(exchange_data, { orderId, symbol });
+    if (order.status) return true;
+    return false;
+}
+
+// function used to calculate min price precision;
+async function calculatePricePrecision() {
+    let data = await exchangeUtil.fetchCurrencies(exchange_data);
+    let pair = bot_config.symbol.split('/')[1];
+    let value = (data && data.data) ? data.data[pair].precision : 8;
+    state.pricePrecision = (1 / Math.pow(10, value));
+    state.precisionValue = value;
+}
+
+// function used to get user balance form exchange;
+async function getUserBalance() {
+    let data = await exchangeUtil.fetchBalance(exchange_data);
+    return (data.data) ? data.data : {};
+}
+
+// function used to start socket to get best ask and best bid;
+async function getBest() {
+    let result = await exchangeUtil.fetchOrderBook(exchange_data, { symbol: bot_config.symbol });
+    let ask = 9999999, bid = 0;
+    if (result.data && result.data.asks && result.data.asks.length) ask = result.data.asks[0][0];
+    if (result.data && result.data.bids && result.data.bids.length) bid = result.data.bids[0][0];
+    return { ask, bid };
+}
